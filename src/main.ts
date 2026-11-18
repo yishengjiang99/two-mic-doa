@@ -42,7 +42,22 @@ async function listDevices() {
     if (devs.some((d) => d.deviceId === prev)) sel.value = prev;
     else if (devs[pick]) sel.value = devs[pick].deviceId;
   }
-  if (!devs.length) showError('No microphones found.');
+  // Before permission, Safari/Firefox hide devices and Chrome hides ids and labels.
+  const locked = !devs.length || devs.every((d) => !d.deviceId || !d.label);
+  allowBtn.classList.toggle('hidden', !locked);
+  if (locked) showError('Click "Allow microphones" so the browser lists your mics.');
+  else if (out.error.textContent?.startsWith('Click "Allow')) showError('');
+}
+
+const allowBtn = $('allow') as HTMLButtonElement;
+async function allowMics() {
+  showError('');
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    s.getTracks().forEach((t) => t.stop());
+    await listDevices();
+    await probeStereo();
+  } catch (e) { showError(describeError(e)); }
 }
 
 /** Opens device A asking for 2 channels; offers L/R mode if it actually delivers 2. */
@@ -244,6 +259,7 @@ function drawCorr(r: Float64Array) {
   g.strokeStyle = css('--muted'); g.beginPath(); g.moveTo(W / 2, 0); g.lineTo(W / 2, H); g.stroke();
 }
 
+allowBtn.onclick = allowMics;
 btn.start.onclick = start;
 btn.stop.onclick = stop;
 btn.cal.onclick = startCalibration;
