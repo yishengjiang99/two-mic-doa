@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { fft, gccPhat, angleDeg, speedOfSound, fitLine } from '../src/dsp';
+import { fft, gccPhat, angleDeg, speedOfSound, fitLine, HighPass, analyze, snrMask, cross, gccFromCross, NoiseFloor, solveDoa, tdoa, azVec, trianglePositions, type Vec2 } from '../src/dsp';
 
 // Seeded PRNG so tests are deterministic.
 function rng(seed: number) {
@@ -55,7 +55,7 @@ describe('gccPhat', () => {
     const { a, b } = delayedPair(4096, 250.4);
     const r = gccPhat(a, b, 30, 245);
     expect(Math.abs(r.lag - 250.4)).toBeLessThan(0.25);
-    expect(r.corr.length).toBe(61);
+    expect(r.corr.length).toBe(241);
   });
   it('uncorrelated noise has low peak', () => {
     const r1 = rng(3), r2 = rng(99);
@@ -78,5 +78,128 @@ describe('geometry', () => {
     const t = [0, 2, 4, 6], y = t.map((v) => 100 + 0.5 * v);
     const { a, b } = fitLine(t, y);
     expect(a).toBeCloseTo(100); expect(b).toBeCloseTo(0.5);
+  });
+});
+
+/** Band-limited white noise (band in fractions of Nyquist), length m, via FFT masking. */
+function bandNoise(m: number, lo: number, hi: number, seed: number) {
+  const r = rng(seed), re = Float64Array.from({ length: m }, r), im = new Float64Array(m);
+  fft(re, im);
+  for (let k = 0; k < m; k++) { const f = Math.min(k, m - k) / (m / 2); if (f < lo || f > hi) re[k] = im[k] = 0; }
+  fft(re, im, true);
+  return re.map((v) => v / m);
+}
+/** Channels of one source with fractional delays (samples), FFT phase shift on a long buffer. */
+function delayedSet(n: number, delays: number[], seed = 5) {
+  const m = n * 4, r = rng(seed), src = Float64Array.from({ length: m }, r), si = new Float64Array(m);
+  fft(src, si);
+  return delays.map((dl) => {
+    const re = new Float64Array(m), im = new Float64Array(m);
+    for (let k = 0; k < m; k++) {
+      const f = k <= m / 2 ? k : k - m, ph = (-2 * Math.PI * f * dl) / m, c = Math.cos(ph), s = Math.sin(ph);
+      re[k] = src[k] * c - si[k] * s; im[k] = src[k] * s + si[k] * c;
+    }
+    im[m / 2] = 0;
+    fft(re, im, true);
+    return Float64Array.from({ length: n }, (_, i) => re[n + i] / m);
+  });
+}
+const rmsOf = (x: ArrayLike<number>, from = 0) => { let s = 0; for (let i = from; i < x.length; i++) s += x[i] ** 2; return Math.sqrt(s / (x.length - from)); };
+const sine = (n: number, f: number, fs: number, a = 1, dc = 0) => Float64Array.from({ length: n }, (_, i) => dc + a * Math.sin((2 * Math.PI * f * i) / fs));
+
+describe('high-pass', () => {
+  const fs = 48000, n = 48000, skip = 4800; // judge after 100 ms of settling
+  it('removes DC and 60 Hz hum (> 20 dB)', () => {
+    const y = new HighPass(120, fs).process(sine(n, 60, fs, 1, 0.5));
+    expect(rmsOf(y, skip)).toBeLessThan(0.1 * rmsOf(sine(n, 60, fs), skip));
+  });
+  it('passes 1 kHz within 0.5 dB', () => {
+    const x = sine(n, 1000, fs), y = new HighPass(120, fs).process(x);
+    expect(Math.abs(20 * Math.log10(rmsOf(y, skip) / rmsOf(x, skip)))).toBeLessThan(0.5);
+  });
+  it('chunked processing matches one pass', () => {
+    const x = sine(4096, 300, fs, 1, 0.2), one = new HighPass(120, fs).process(x);
+    const hp = new HighPass(120, fs), parts = [hp.process(x.subarray(0, 1000)), hp.process(x.subarray(1000))];
+    const two = new Float32Array(4096); two.set(parts[0]); two.set(parts[1], 1000);
+    expect(Math.max(...one.map((v, i) => Math.abs(v - two[i])))).toBeLessThan(1e-6);
+  });
+});
+
+describe('SNR weighting and boundary', () => {
+  it('snrMask = max(0, 1 - N/|X|^2)', () => {
+    expect([...snrMask(Float64Array.of(4, 1, 0.5), Float64Array.of(1, 1, 1))]).toEqual([0.75, 0, 0]);
+    expect([...snrMask(Float64Array.of(2, 3))]).toEqual([1, 1]);
+  });
+  it('mask from a learned noise floor lifts confidence when independent noise fills most bins', () => {
+    const n = 4096, m = 4 * n, off = n, D = 6;
+    const sig = bandNoise(m, 0, 0.25, 1); // shared low band
+    const noiseA = (s: number) => bandNoise(m, 0.3, 1, s).map((v) => 8 * v); // loud, independent, upper band
+    const na = noiseA(11), nb = noiseA(12);
+    const a = Float64Array.from({ length: n }, (_, i) => sig[off + i] + na[off + i]);
+    const b = Float64Array.from({ length: n }, (_, i) => sig[off + i - D] + nb[off + i]);
+    const nfA = new NoiseFloor(0.5), nfB = new NoiseFloor(0.5);
+    for (let s = 0; s < 6; s++) { // noise-only frames
+      nfA.update(analyze(noiseA(100 + s).subarray(off, off + n)).pow);
+      nfB.update(analyze(noiseA(200 + s).subarray(off, off + n)).pow);
+    }
+    const A = analyze(a), B = analyze(b);
+    const plain = gccFromCross(cross(A, B), 30);
+    const masked = gccFromCross(cross(A, B, snrMask(A.pow, nfA.psd), snrMask(B.pow, nfB.psd)), 30);
+    expect(Math.abs(masked.lag - D)).toBeLessThan(0.3);
+    expect(masked.peak).toBeGreaterThan(0.6);
+    expect(masked.peak).toBeGreaterThan(2 * plain.peak);
+  });
+  it('flags a peak on the search boundary', () => {
+    // Low-band source + faint white noise; the SNR mask keeps only the band, so the main lobe is wide
+    // and still rising at the boundary when the true lag is outside the search window.
+    const n = 2048, sig = bandNoise(4 * n, 0, 0.1, 3), r1 = rng(21), r2 = rng(22), r3 = rng(23);
+    const a = Float64Array.from({ length: n }, (_, i) => sig[n + i] + 1e-3 * r1());
+    const b = Float64Array.from({ length: n }, (_, i) => sig[n + i - 13] + 1e-3 * r2());
+    const nf = new NoiseFloor(0.2);
+    for (let s = 0; s < 20; s++) nf.update(analyze(Float64Array.from({ length: n }, () => 1e-3 * r3())).pow);
+    const A = analyze(a), B = analyze(b), x = cross(A, B, snrMask(A.pow, nf.psd), snrMask(B.pow, nf.psd));
+    expect(gccFromCross(x, 10).edge).toBe(true);
+    const r = gccFromCross(x, 30);
+    expect(r.edge).toBe(false);
+    expect(Math.abs(r.lag - 13)).toBeLessThan(0.2);
+  });
+  it('4x upsampled lag is within 0.1 sample', () => {
+    for (const dl of [2.3, -5.6, 7.15]) {
+      const { a, b } = delayedPair(4096, dl);
+      expect(Math.abs(gccPhat(a, b, 30).lag - dl)).toBeLessThan(0.1);
+    }
+  });
+});
+
+describe('3-mic solver', () => {
+  const c = speedOfSound(20), fs = 48000;
+  const pairs = [[0, 1], [0, 2], [1, 2]] as const;
+  const angErr = (x: number, y: number) => Math.abs(((x - y + 540) % 360) - 180);
+  const taus = (pos: Vec2[], az: number, noise = 0, r = rng(9)) =>
+    pairs.map(([i, j]) => ({ i, j, tau: tdoa(pos[i], pos[j], azVec(az), c) + (noise * r()) / fs }));
+  it('matches the 2-mic convention', () => {
+    const [A, B] = trianglePositions(0.2);
+    for (const az of [0, 30, 90, 150, 180]) expect(angleDeg(tdoa(A, B, azVec(az), c), 0.2, c)).toBeCloseTo(az, 6);
+  });
+  it('round-trips every azimuth (equilateral)', () => {
+    const pos = trianglePositions(0.2);
+    for (let az = 0; az < 360; az += 7) expect(angErr(solveDoa(pos, taus(pos, az), c).az, az)).toBeLessThan(1e-6);
+  });
+  it('within 1° with ±0.25-sample lag noise, arbitrary triangle', () => {
+    const pos: Vec2[] = [[-0.15, 0], [0.12, 0.02], [0.03, 0.25]];
+    for (let az = 3; az < 360; az += 11) expect(angErr(solveDoa(pos, taus(pos, az, 0.25), c).az, az)).toBeLessThan(1);
+  });
+  it('collinear mics give NaN', () => {
+    const pos: Vec2[] = [[0, 0], [0.1, 0], [0.2, 0]];
+    expect(solveDoa(pos, taus(pos, 40), c).az).toBeNaN();
+  });
+  it('end to end: GCC-PHAT on 3 synthetic channels recovers the azimuth within 2°', () => {
+    const pos = trianglePositions(0.3);
+    for (const az of [20, 135, 250, 315]) {
+      const t = pos.map((p) => tdoa([0, 0], p, azVec(az), c) * fs); // arrival delay of each mic vs origin, samples
+      const ch = delayedSet(4096, t);
+      const est = pairs.map(([i, j]) => ({ i, j, tau: gccPhat(ch[i], ch[j], 40).lag / fs }));
+      expect(angErr(solveDoa(pos, est, c).az, az)).toBeLessThan(2);
+    }
   });
 });
