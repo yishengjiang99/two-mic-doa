@@ -1,4 +1,6 @@
 import { analyze, snrMask, cross, sumCross, gccFromCross, NoiseFloor, type Cross, type Frame, speedOfSound, maxLagSamples, angleDeg, fitLine, median, HighPass, spectrumDb, solveDoa, tdoa, azVec, trianglePositions, type Vec2 } from './dsp';
+// Hashed by Vite so a cached old worklet can never pair with new page code.
+import workletUrl from './capture-worklet.js?url';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const devA = $<HTMLSelectElement>('devA'), devB = $<HTMLSelectElement>('devB'), devC = $<HTMLSelectElement>('devC');
@@ -139,7 +141,7 @@ async function start() {
   btn.start.disabled = true;
   try {
     ctx = new AudioContext({ latencyHint: 'interactive' });
-    await ctx.audioWorklet.addModule(`${import.meta.env.BASE_URL}capture-worklet.js`);
+    await ctx.audioWorklet.addModule(workletUrl);
     const size = ctx.sampleRate > 60000 ? 8192 : 4096, hop = size / 2;
     const node = new AudioWorkletNode(ctx, 'capture', {
       numberOfInputs: 1, numberOfOutputs: 1, channelCount: nMics, channelCountMode: 'explicit', channelInterpretation: 'discrete',
@@ -172,7 +174,8 @@ async function start() {
     let filled = 0;
     specEma = [];
     node.port.onmessage = (ev) => {
-      const { ch, t } = ev.data as { ch: Float32Array[]; t: number };
+      const { ch, t } = ev.data as { ch?: Float32Array[]; t: number };
+      if (!Array.isArray(ch) || ch.length !== nMics) { showError('Audio worklet is out of date. Reload the page.'); return stop(); }
       ch.forEach((x, k) => { win[k].copyWithin(0, x.length); hp[k].process(x, win[k].subarray(size - x.length)); });
       filled = Math.min(size, filled + hop);
       if (filled === size) onWindow(win, t, size);
@@ -208,8 +211,7 @@ function onWindow(chs: Float32Array[], t: number, size: number) {
   if (!ctx) return;
   const fs = ctx.sampleRate, lo = HP_HZ / fs;
   const frames = chs.map(analyze);
-  drawWave(chs);
-  drawSpectra(frames);
+  try { drawWave(chs); drawSpectra(frames); } catch (e) { showError(`Drawing failed: ${(e as Error).message}`); }
   const { d, c, pos } = params();
   const level = Math.min(...chs.map(rms));
   const onset = Math.min(...chs.map(peakAbs)) > 6 * floor;
