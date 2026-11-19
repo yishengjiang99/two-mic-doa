@@ -53,7 +53,7 @@ const allowBtn = $('allow') as HTMLButtonElement;
 async function allowMics() {
   showError('');
   try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const s = await navigator.mediaDevices.getUserMedia({ audio: RAW });
     s.getTracks().forEach((t) => t.stop());
     await listDevices();
     await probeStereo();
