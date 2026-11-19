@@ -1,4 +1,4 @@
-import { analyze, snrMask, cross, sumCross, gccFromCross, NoiseFloor, type Cross, type Frame, speedOfSound, maxLagSamples, angleDeg, fitLine, median, HighPass, spectrumDb, solveDoa, tdoa, azVec, trianglePositions, type Vec2 } from './dsp';
+import { heat2, srp, ageAlpha, analyze, snrMask, cross, sumCross, gccFromCross, NoiseFloor, type Cross, type Frame, speedOfSound, maxLagSamples, angleDeg, fitLine, median, HighPass, spectrumDb, solveDoa, tdoa, azVec, trianglePositions, type Vec2 } from './dsp';
 // Hashed by Vite so a cached old worklet can never pair with new page code.
 import workletUrl from './capture-worklet.js?url';
 
@@ -32,6 +32,13 @@ let calRun: { until: number; t: number[]; lag: number[][] } | null = null;
 let clickTimer = 0;
 let specEma: Float64Array[] = [];
 let noise: NoiseFloor[] = [];
+// Direction plot state: smoothed direction, live correlation heat over angle, and recent confident hits.
+let dirAng: number | null = null;
+let heat: Float64Array | null = null;
+let hits: { ang: number; t: number }[] = [];
+let lastHit = -Infinity;
+const FADE_S = 2;
+const now = () => performance.now() / 1000;
 let ring: { t: number; x: Cross[] }[] = []; // recent onset frames: one cross spectrum per pair
 
 const showError = (m: string) => { out.error.textContent = m; };
@@ -136,6 +143,7 @@ async function start() {
   pairs = nMics === 3 ? [[0, 1], [0, 2], [1, 2]] : [[0, 1]];
   ema = pairs.map(() => null);
   noise = Array.from({ length: nMics }, () => new NoiseFloor());
+  dirAng = null; heat = null; hits = []; lastHit = -Infinity;
   ring = [];
   if (cal && cal.length !== nMics - 1) cal = null;
   btn.start.disabled = true;
@@ -216,10 +224,21 @@ function onWindow(chs: Float32Array[], t: number, size: number) {
   const level = Math.min(...chs.map(rms));
   const onset = Math.min(...chs.map(peakAbs)) > 6 * floor;
   floor = level < floor ? 0.9 * floor + 0.1 * level : floor * 1.002 + 1e-7; // tracks quiet level
-  if (!onset) { // quiet frame: learn the noise floor, keep the last estimate
+  // Correlation per pair for frames xs, searched ±(d/c + 2) around the calibrated offset.
+  const search = (xs: Cross[]) => pairs.map(([i, j], p) => {
+    const center = calCenter(j, t) - calCenter(i, t), phys = maxLagSamples(dist(pos[i], pos[j]), c, fs);
+    const r = gccFromCross(xs[p], phys + 2, center);
+    return { r, i, j, center, rel: Math.max(-phys, Math.min(phys, r.lag - center)) };
+  });
+  const setHeat = (rs: ReturnType<typeof search>) => { heat = nMics === 2 ? heat2(rs[0].r, rs[0].center, d, c, fs, 1) : srp(rs, pos, c, fs, 2); };
+  const angleOf = (lags: number[]) =>
+    nMics === 2 ? angleDeg(lags[0] / fs, d, c) : solveDoa(pos, pairs.map(([i, j], p) => ({ i, j, tau: lags[p] / fs })), c).az;
+
+  if (!onset) { // quiet frame: learn the noise floor, keep the last estimate, show raw (unmasked) heat
     frames.forEach((f, k) => noise[k].update(f.pow));
     lastConf = 0; out.conf.textContent = '0.00';
-    return;
+    if (!calRun) setHeat(search(pairs.map(([i, j]) => cross(frames[i], frames[j], undefined, undefined, lo))));
+    return drawDir();
   }
   const masks = frames.map((f, k) => snrMask(f.pow, noise[k].psd));
   const xc = (i: number, j: number) => cross(frames[i], frames[j], masks[i], masks[j], lo);
@@ -235,36 +254,31 @@ function onWindow(chs: Float32Array[], t: number, size: number) {
     }
     out.cal.textContent = `Calibrating… clap or click at ${calAz.value || 90}°. ${calRun.t.length} hits, ${Math.max(0, calRun.until - t).toFixed(1)} s left`;
     if (t >= calRun.until) finishCalibration();
-    return;
+    return drawDir();
   }
 
   ring = [...ring.filter((r) => t - r.t < AVG_SECONDS), { t, x: pairs.map(([i, j]) => xc(i, j)) }].slice(-AVG_FRAMES);
-  const rs = pairs.map(([i, j], p) => {
-    const center = calCenter(j, t) - calCenter(i, t), phys = maxLagSamples(dist(pos[i], pos[j]), c, fs);
-    const r = gccFromCross(sumCross(ring.map((f) => f.x[p])), phys + 2, center);
-    return { ...r, rel: Math.max(-phys, Math.min(phys, r.lag - center)) };
-  });
-  drawCorr(rs[0].corr);
-  lastConf = level > 1e-5 && !rs.some((r) => r.edge) ? Math.min(...rs.map((r) => r.peak)) : 0;
-  out.conf.textContent = rs.some((r) => r.edge) ? 'edge' : lastConf.toFixed(2);
+  const rs = search(pairs.map((_, p) => sumCross(ring.map((f) => f.x[p]))));
+  setHeat(rs);
+  drawCorr(rs[0].r.corr);
+  const edge = rs.some((x) => x.r.edge);
+  lastConf = level > 1e-5 && !edge ? Math.min(...rs.map((x) => x.r.peak)) : 0;
+  out.conf.textContent = edge ? 'edge' : lastConf.toFixed(2);
   if (lastConf >= +thresh.value) {
     const k = +alpha.value;
-    ema = rs.map((r, p) => (ema[p] === null ? r.rel : k * r.rel + (1 - k) * ema[p]!));
+    ema = rs.map((x, p) => (ema[p] === null ? x.rel : k * x.rel + (1 - k) * ema[p]!));
+    const hit = angleOf(rs.map((x) => x.rel));
+    if (Number.isFinite(hit)) { lastHit = now(); hits = [...hits.filter((h) => lastHit - h.t < FADE_S), { ang: hit, t: lastHit }]; }
   }
-  if (ema[0] === null) return drawEmpty();
-  const lags = ema as number[];
-  out.delayMs.textContent = lags.map((l) => ((l / fs) * 1000).toFixed(3)).join(' / ') + ' ms';
-  out.delaySmp.textContent = lags.map((l) => l.toFixed(2)).join(' / ');
-  if (nMics === 2) {
-    const ang = angleDeg(lags[0] / fs, d, c);
-    out.angle.textContent = `${ang.toFixed(1)}°`;
-    drawView(ang);
-  } else {
-    const sol = solveDoa(pos, pairs.map(([i, j], p) => ({ i, j, tau: lags[p] / fs })), c);
-    if (Number.isNaN(sol.az)) { showError('Mic positions are collinear; 3 mics need a triangle.'); return drawPolar(null, pos); }
-    out.angle.textContent = `${sol.az.toFixed(1)}°`;
-    drawPolar(sol.az, pos);
+  if (ema[0] !== null) {
+    const lags = ema as number[];
+    out.delayMs.textContent = lags.map((l) => ((l / fs) * 1000).toFixed(3)).join(' / ') + ' ms';
+    out.delaySmp.textContent = lags.map((l) => l.toFixed(2)).join(' / ');
+    const ang = angleOf(lags);
+    if (Number.isNaN(ang)) showError('Mic positions are collinear; 3 mics need a triangle.');
+    else { dirAng = ang; out.angle.textContent = `${ang.toFixed(1)}°`; }
   }
+  drawDir();
 }
 
 function startCalibration() {
@@ -317,60 +331,65 @@ function toggleClicks() {
   btn.click.textContent = 'Stop clicks';
 }
 
-function drawEmpty() {
-  if (nMics === 2) drawView(null);
-  else drawPolar(null, params().pos);
-}
+const drawEmpty = () => drawDir();
 
-/** 2 mics: front half-plane, 0° = toward A (left). */
-function drawView(ang: number | null) {
-  const g = view.getContext('2d')!, W = view.width, H = view.height;
-  const cx = W / 2, cy = H - 40, R = Math.min(W / 2, H) - 60;
+/**
+ * Direction plot. 2 mics: front half-circle; 3 mics: full circle with mics at their positions.
+ * Angles follow the app convention (0° = toward A/left, 90° = ahead); screen angle φ = π + az.
+ * Layers: live correlation heat band inside the arc, fading dots for recent confident hits, and a ray
+ * that fades with time since the last confident hit.
+ */
+function drawDir() {
+  const g = view.getContext('2d')!, W = view.width, H = view.height, full = nMics === 3;
+  const cx = W / 2, cy = full ? H / 2 : H - 40, R = full ? H / 2 - 30 : Math.min(W / 2, H) - 60;
+  const phi = (az: number) => Math.PI + (az * Math.PI) / 180;
+  const P = (az: number, r: number) => [cx + Math.cos(phi(az)) * r, cy + Math.sin(phi(az)) * r] as const;
+  const ray = css('--ray'), muted = css('--muted'), t = now();
   g.clearRect(0, 0, W, H);
-  g.strokeStyle = css('--muted'); g.fillStyle = css('--muted'); g.lineWidth = 1; g.font = '12px system-ui';
-  g.beginPath(); g.arc(cx, cy, R, Math.PI, 0); g.stroke();
-  for (const deg of [0, 45, 90, 135, 180]) {
-    const th = (deg * Math.PI) / 180;
-    g.fillText(`${deg}°`, cx - Math.cos(th) * (R + 14) - 10, cy - Math.sin(th) * (R + 14));
-  }
-  const mx = R * 0.35;
-  for (const [x, l, col] of [[cx - mx, 'A', colors()[0]], [cx + mx, 'B', colors()[1]]] as const) {
-    g.fillStyle = col;
-    g.beginPath(); g.arc(x, cy, 9, 0, 2 * Math.PI); g.fill();
-    g.fillText(`Mic ${l}`, x - 16, cy + 26);
-  }
-  if (ang === null) return;
-  const th = (ang * Math.PI) / 180;
-  g.globalAlpha = lastConf >= +thresh.value ? 1 : 0.35;
-  g.strokeStyle = css('--ray'); g.lineWidth = 4;
-  g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx - Math.cos(th) * R, cy - Math.sin(th) * R); g.stroke();
-  g.globalAlpha = 1;
-}
+  g.strokeStyle = muted; g.fillStyle = muted; g.lineWidth = 1; g.font = '12px system-ui';
+  g.beginPath(); g.arc(cx, cy, R, Math.PI, full ? 3 * Math.PI : 2 * Math.PI); g.stroke();
+  for (let deg = 0; deg <= (full ? 315 : 180); deg += 45) { const [x, y] = P(deg, R + 16); g.fillText(`${deg}°`, x - 10, y + 4); }
 
-/** 3 mics: full circle, mics drawn at their positions around the centroid. */
-function drawPolar(az: number | null, pos: Vec2[]) {
-  const g = view.getContext('2d')!, W = view.width, H = view.height;
-  const cx = W / 2, cy = H / 2, R = H / 2 - 30;
-  g.clearRect(0, 0, W, H);
-  g.strokeStyle = css('--muted'); g.fillStyle = css('--muted'); g.lineWidth = 1; g.font = '12px system-ui';
-  g.beginPath(); g.arc(cx, cy, R, 0, 2 * Math.PI); g.stroke();
-  for (let deg = 0; deg < 360; deg += 45) {
-    const [ux, uy] = azVec(deg);
-    g.fillText(`${deg}°`, cx + ux * (R + 16) - 10, cy - uy * (R + 16) + 4);
+  if (heat) { // opacity ∝ (corr / frame max)², overall strength grows with the max so noise stays faint
+    const step = (full ? 360 : 180) / (full ? heat.length : heat.length - 1);
+    const mx = Math.max(...heat), strength = 0.25 + 0.75 * Math.min(1, Math.max(0, mx) / 0.5);
+    g.strokeStyle = ray; g.lineWidth = 12;
+    heat.forEach((v, k) => {
+      const a = (Math.max(0, v) / Math.max(mx, 0.05)) ** 2 * strength;
+      if (a < 0.02) return;
+      g.globalAlpha = a;
+      g.beginPath(); g.arc(cx, cy, R - 10, phi(k * step - step / 2), phi(k * step + step / 2)); g.stroke();
+    });
+    g.globalAlpha = 1;
   }
-  const mx = pos.reduce((s, p) => s + p[0], 0) / pos.length, my = pos.reduce((s, p) => s + p[1], 0) / pos.length;
-  const span = Math.max(1e-6, ...pos.map((p) => Math.hypot(p[0] - mx, p[1] - my)));
-  pos.forEach((p, k) => {
-    const x = cx + ((p[0] - mx) / span) * R * 0.35, y = cy - ((p[1] - my) / span) * R * 0.35;
-    g.fillStyle = colors()[k];
+
+  const col = colors();
+  const mics: [number, number][] = full
+    ? (() => {
+        const pos = params().pos, mx = pos.reduce((s, p) => s + p[0], 0) / 3, my = pos.reduce((s, p) => s + p[1], 0) / 3;
+        const span = Math.max(1e-6, ...pos.map((p) => Math.hypot(p[0] - mx, p[1] - my)));
+        return pos.map((p) => [cx + ((p[0] - mx) / span) * R * 0.35, cy - ((p[1] - my) / span) * R * 0.35] as [number, number]);
+      })()
+    : [[cx - R * 0.35, cy], [cx + R * 0.35, cy]];
+  mics.forEach(([x, y], k) => {
+    g.fillStyle = col[k];
     g.beginPath(); g.arc(x, y, 9, 0, 2 * Math.PI); g.fill();
     g.fillText(`Mic ${NAMES[k]}`, x - 16, y + 24);
   });
-  if (az === null) return;
-  const [ux, uy] = azVec(az);
-  g.globalAlpha = lastConf >= +thresh.value ? 1 : 0.35;
-  g.strokeStyle = css('--ray'); g.lineWidth = 4;
-  g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + ux * R, cy - uy * R); g.stroke();
+
+  hits = hits.filter((h) => t - h.t < FADE_S);
+  g.fillStyle = ray;
+  for (const h of hits) {
+    const [x, y] = P(h.ang, R);
+    g.globalAlpha = ageAlpha(t - h.t, FADE_S);
+    g.beginPath(); g.arc(x, y, 6, 0, 2 * Math.PI); g.fill();
+  }
+  if (dirAng !== null) {
+    const [x, y] = P(dirAng, R - 20);
+    g.globalAlpha = Math.max(0.12, ageAlpha(t - lastHit, FADE_S));
+    g.strokeStyle = ray; g.lineWidth = 4;
+    g.beginPath(); g.moveTo(cx, cy); g.lineTo(x, y); g.stroke();
+  }
   g.globalAlpha = 1;
 }
 
@@ -450,7 +469,7 @@ btn.start.onclick = start;
 btn.stop.onclick = stop;
 btn.cal.onclick = startCalibration;
 btn.click.onclick = toggleClicks;
-btn.resetCal.onclick = () => { cal = null; ema = pairs.map(() => null); ring = []; btn.resetCal.disabled = true; updateOffset(); out.cal.textContent = ''; };
+btn.resetCal.onclick = () => { cal = null; ema = pairs.map(() => null); ring = []; dirAng = null; btn.resetCal.disabled = true; updateOffset(); out.cal.textContent = ''; };
 devA.onchange = probeChannels;
 devC.onchange = posIn.oninput = baseline.oninput = () => { if (!ctx) { nMics = devC.value ? 3 : 2; drawEmpty(); } };
 navigator.mediaDevices?.addEventListener('devicechange', () => listDevices().then(probeChannels));

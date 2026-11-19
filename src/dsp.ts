@@ -49,6 +49,9 @@ export interface GccResult {
   peak: number;
   /** Correlation on the upsampled lag grid, center-maxLag..center+maxLag. */
   corr: Float64Array;
+  /** Lag (samples) of corr[0], and grid points per sample: corr[i] is at lag lo + i / up. */
+  lo: number;
+  up: number;
   /** True when the peak sits on the search boundary: the real peak is outside the window, so the lag is unreliable. */
   edge: boolean;
 }
@@ -141,7 +144,7 @@ export function gccFromCross(x: Cross, maxLag: number, center = 0, up = 4): GccR
   const y0 = at(best - 1), y1 = at(best), y2 = at(best + 1);
   const den = y0 - 2 * y1 + y2;
   const frac = den < 0 ? Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / den)) : 0;
-  return { lag: (best + frac) / up, peak: y1, corr, edge: best === lo || best === hi };
+  return { lag: (best + frac) / up, peak: y1, corr, edge: best === lo || best === hi, lo: lo / up, up };
 }
 
 /** Single-frame GCC-PHAT between equal-length windows a and b (no noise mask, no averaging). */
@@ -253,3 +256,32 @@ export function solveDoa(pos: Vec2[], pairs: PairTdoa[], c: number): { az: numbe
   for (const { i, j, tau } of pairs) e += (tdoa(pos[i], pos[j], u, c) - tau) ** 2;
   return { az: azOf(u), u, resid: Math.sqrt(e / pairs.length) };
 }
+
+/** Correlation at any lag (samples), linear between grid points; 0 outside the searched range. */
+export function corrAt(r: Pick<GccResult, 'corr' | 'lo' | 'up'>, lag: number): number {
+  const x = (lag - r.lo) * r.up, i = Math.floor(x);
+  if (i < 0 || i >= r.corr.length - 1) return i === r.corr.length - 1 && x === i ? r.corr[i] : 0;
+  return r.corr[i] + (x - i) * (r.corr[i + 1] - r.corr[i]);
+}
+
+/** 2-mic heat: correlation at each angle 0..180° (step°), via the lag that angle implies: center + d·cos(θ)/c·fs. */
+export function heat2(r: Pick<GccResult, 'corr' | 'lo' | 'up'>, center: number, d: number, c: number, fs: number, step = 1): Float64Array {
+  const out = new Float64Array(Math.floor(180 / step) + 1);
+  for (let k = 0; k < out.length; k++) out[k] = corrAt(r, center + ((d * Math.cos((k * step * Math.PI) / 180)) / c) * fs);
+  return out;
+}
+
+/** 3-mic steered response power: mean pairwise correlation at the lag each azimuth (0..360-step) implies. */
+export function srp(rs: { r: Pick<GccResult, 'corr' | 'lo' | 'up'>; i: number; j: number; center: number }[], pos: Vec2[], c: number, fs: number, step = 2): Float64Array {
+  const out = new Float64Array(Math.round(360 / step));
+  for (let k = 0; k < out.length; k++) {
+    const u = azVec(k * step);
+    let s = 0;
+    for (const { r, i, j, center } of rs) s += corrAt(r, center + tdoa(pos[i], pos[j], u, c) * fs);
+    out[k] = s / rs.length;
+  }
+  return out;
+}
+
+/** Linear fade: 1 at age 0, 0 at `life` seconds and after. */
+export const ageAlpha = (age: number, life = 2) => Math.max(0, Math.min(1, 1 - age / life));

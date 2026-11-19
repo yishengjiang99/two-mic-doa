@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { fft, gccPhat, angleDeg, speedOfSound, fitLine, HighPass, analyze, snrMask, cross, gccFromCross, NoiseFloor, solveDoa, tdoa, azVec, trianglePositions, type Vec2 } from '../src/dsp';
+import { maxLagSamples, corrAt, heat2, srp, ageAlpha, fft, gccPhat, angleDeg, speedOfSound, fitLine, HighPass, analyze, snrMask, cross, gccFromCross, NoiseFloor, solveDoa, tdoa, azVec, trianglePositions, type Vec2 } from '../src/dsp';
 
 // Seeded PRNG so tests are deterministic.
 function rng(seed: number) {
@@ -201,5 +201,50 @@ describe('3-mic solver', () => {
       const est = pairs.map(([i, j]) => ({ i, j, tau: gccPhat(ch[i], ch[j], 40).lag / fs }));
       expect(angErr(solveDoa(pos, est, c).az, az)).toBeLessThan(2);
     }
+  });
+});
+
+describe('direction plot', () => {
+  const c = speedOfSound(20), fs = 48000, d = 0.2;
+  const argmax = (h: Float64Array) => h.indexOf(Math.max(...h));
+  it('corrAt interpolates on the lag grid', () => {
+    const r = { corr: Float64Array.of(0, 1, 0.5), lo: -1, up: 2 }; // lags -1, -0.5, 0
+    expect(corrAt(r, -0.75)).toBeCloseTo(0.5);
+    expect(corrAt(r, -0.25)).toBeCloseTo(0.75);
+    expect(corrAt(r, 0)).toBeCloseTo(0.5);
+    expect(corrAt(r, 3)).toBe(0);
+  });
+  it('2-mic heat maps lag to angle by acos(c·tau/d)', () => {
+    for (const lag of [0, 10, -10, 20, -25]) {
+      // synthetic correlation peaked at `lag` on the app's ¼-sample grid, ±30 samples
+      const lo = -30, up = 4, corr = Float64Array.from({ length: 60 * up + 1 }, (_, i) => Math.max(0, 1 - Math.abs(lo + i / up - lag) / 3));
+      const expected = angleDeg(lag / fs, d, c);
+      expect(Math.abs(argmax(heat2({ corr, lo, up }, 0, d, c, fs, 1)) - expected)).toBeLessThanOrEqual(1);
+      // a calibration offset shifts the lag axis, not the angle
+      const shifted = { corr, lo: lo + 7, up };
+      expect(Math.abs(argmax(heat2(shifted, 7, d, c, fs, 1)) - expected)).toBeLessThanOrEqual(1);
+    }
+  });
+  it('2-mic heat peaks at the GCC-PHAT angle', () => {
+    const { a, b } = delayedPair(4096, 12.4);
+    const r = gccPhat(a, b, maxLagSamples(d, c, fs) + 2);
+    expect(Math.abs(argmax(heat2(r, 0, d, c, fs)) - angleDeg(r.lag / fs, d, c))).toBeLessThanOrEqual(1);
+  });
+  it('3-mic steered response peaks at the true azimuth', () => {
+    const pos = trianglePositions(0.3);
+    for (const az of [40, 200, 300]) {
+      const ch = delayedSet(4096, pos.map((p) => tdoa([0, 0], p, azVec(az), c) * fs));
+      const rs = ([[0, 1], [0, 2], [1, 2]] as const).map(([i, j]) => ({ r: gccPhat(ch[i], ch[j], 40), i, j, center: 0 }));
+      const h = srp(rs, pos, c, fs, 2), err = Math.abs(((argmax(h) * 2 - az + 540) % 360) - 180);
+      expect(err).toBeLessThanOrEqual(3);
+    }
+  });
+  it('age alpha fades linearly to 0 at the lifetime', () => {
+    expect(ageAlpha(0)).toBe(1);
+    expect(ageAlpha(1)).toBeCloseTo(0.5);
+    expect(ageAlpha(2)).toBe(0);
+    expect(ageAlpha(5)).toBe(0);
+    expect(ageAlpha(-1)).toBe(1);
+    expect(ageAlpha(0.5, 1)).toBeCloseTo(0.5);
   });
 });
