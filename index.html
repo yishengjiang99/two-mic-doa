@@ -3,20 +3,22 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Two-Mic Direction Finder</title>
+<title>Mic Direction Finder</title>
 <link rel="icon" href="data:," />
 <link rel="stylesheet" href="/src/style.css" />
 </head>
 <body>
 <main>
-  <h1>Two-Mic Direction Finder <small>GCC-PHAT</small></h1>
-  <p class="note">Best results: one <b>2-input audio interface</b> (shared clock). Two separate USB mics have independent clocks: a fixed offset plus slow drift. <b>Calibrate</b> before trusting angles, and recalibrate every few minutes.</p>
+  <h1>Mic Direction Finder <small>2 or 3 mics · GCC-PHAT</small></h1>
+  <p class="note">Best results: one <b>multi-input audio interface</b> (shared clock). Separate USB mics have independent clocks: a fixed offset plus slow drift. <b>Calibrate</b> before trusting angles, and recalibrate every few minutes.</p>
 
   <section class="controls">
     <label>Mic A (left) <select id="devA"></select></label>
     <label>Mic B (right) <select id="devB"></select></label>
-    <label class="hidden" id="stereoWrap"><input type="checkbox" id="stereo" /> Use L/R of Mic A (stereo device)</label>
-    <label>Baseline d (m) <input id="baseline" type="number" step="0.01" min="0.02" value="0.20" /></label>
+    <label>Mic C (ahead) <select id="devC"></select></label>
+    <label>Baseline / side d (m) <input id="baseline" type="number" step="0.01" min="0.02" value="0.20" /></label>
+    <label>Mic positions A B C (m) <input id="positions" placeholder="equilateral, side d" size="18" /></label>
+    <label>Cal azimuth (°) <input id="calAz" type="number" step="1" value="90" /></label>
     <label>Temp (°C) <input id="temp" type="number" step="1" value="20" /></label>
     <label>Min confidence <input id="thresh" type="range" min="0" max="1" step="0.01" value="0.15" /> <output id="threshOut">0.15</output></label>
     <label>Smoothing α <input id="alpha" type="range" min="0.05" max="1" step="0.05" value="0.3" /> <output id="alphaOut">0.30</output></label>
@@ -46,9 +48,10 @@
     </div>
   </section>
   <section class="wave">
-    <canvas id="wave" width="1200" height="200" aria-label="Input waveforms"></canvas>
+    <canvas id="wave" width="800" height="200" aria-label="Input waveforms"></canvas>
+    <canvas id="spec" width="400" height="200" aria-label="Input spectra"></canvas>
   </section>
-  <p class="note">Angle convention: measured from the mic axis. <b>0°</b> = toward Mic A (left), <b>90°</b> = broadside (straight ahead), <b>180°</b> = toward Mic B (right). Two mics can't tell front from back; the ray is drawn in the front half-plane.</p>
+  <p class="note">Angle convention: <b>0°</b> = toward Mic A (left), <b>90°</b> = straight ahead, <b>180°</b> = toward Mic B (right), <b>270°</b> = behind. Two mics can't tell front from back, so the ray stays in the front half-plane. With Mic C the azimuth covers the full 0–360°. Mic positions: x right, y ahead, as "x,y x,y x,y" for A B C; blank = equilateral triangle with C ahead. Calibrate with a clap or clicks at the <b>cal azimuth</b>. The spectra shade the band below the 120 Hz high-pass.</p>
 </main>
 <script type="module" src="/src/main.ts"></script>
 </body>

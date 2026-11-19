@@ -1,47 +1,62 @@
-import { gccPhat, speedOfSound, maxLagSamples, angleDeg, fitLine, median } from './dsp';
+import { analyze, snrMask, cross, sumCross, gccFromCross, NoiseFloor, type Cross, type Frame, speedOfSound, maxLagSamples, angleDeg, fitLine, median, HighPass, spectrumDb, solveDoa, tdoa, azVec, trianglePositions, type Vec2 } from './dsp';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
-const devA = $<HTMLSelectElement>('devA'), devB = $<HTMLSelectElement>('devB');
-const stereo = $<HTMLInputElement>('stereo'), stereoWrap = $('stereoWrap');
-const baseline = $<HTMLInputElement>('baseline'), temp = $<HTMLInputElement>('temp');
+const devA = $<HTMLSelectElement>('devA'), devB = $<HTMLSelectElement>('devB'), devC = $<HTMLSelectElement>('devC');
+const baseline = $<HTMLInputElement>('baseline'), temp = $<HTMLInputElement>('temp'), posIn = $<HTMLInputElement>('positions'), calAz = $<HTMLInputElement>('calAz');
 const thresh = $<HTMLInputElement>('thresh'), alpha = $<HTMLInputElement>('alpha');
 const btn = { start: $<HTMLButtonElement>('start'), stop: $<HTMLButtonElement>('stop'), cal: $<HTMLButtonElement>('cal'), click: $<HTMLButtonElement>('click'), resetCal: $<HTMLButtonElement>('resetCal') };
 const out = { angle: $('angle'), delayMs: $('delayMs'), delaySmp: $('delaySmp'), conf: $('conf'), fs: $('fs'), offset: $('offset'), error: $('error'), cal: $('calStatus') };
 const view = $<HTMLCanvasElement>('view'), corrCv = $<HTMLCanvasElement>('corr');
+const waveCv = $<HTMLCanvasElement>('wave'), specCv = $<HTMLCanvasElement>('spec');
 
 const RAW = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
 const CAL_SECONDS = 6;
+const HP_HZ = 120; // high-pass cutoff: kills DC drift and mains hum before analysis and drawing
+const NAMES = ['A', 'B', 'C'];
+const AVG_FRAMES = 4, AVG_SECONDS = 1.5; // cross spectra averaged over the last few onset frames
+const IN2 = '#2', IN3 = '#3'; // select values: "input 2/3 of the Mic A device"
 
 let ctx: AudioContext | null = null;
 let streams: MediaStream[] = [];
-let ema: number | null = null; // smoothed delay, samples, calibration removed
+let nMics = 2;
+let probedCh = 1; // channels the Mic A device delivers
+let pairs: [number, number][] = [[0, 1]];
+let ema: (number | null)[] = [null]; // per pair: smoothed delay, samples, calibration removed
 let lastConf = 0;
 let floor = 1e-4; // running RMS noise floor for transient gating
-// Calibration: offset(t) = a + b * t (samples; t = AudioContext seconds)
-let cal: { a: number; b: number } | null = null;
-let calRun: { until: number; t: number[]; lag: number[] } | null = null;
+// Calibration per mic k ≥ 1, relative to A: offset_k(t) = a + b * t (samples; t = AudioContext seconds)
+let cal: { a: number; b: number }[] | null = null;
+let calRun: { until: number; t: number[]; lag: number[][] } | null = null;
 let clickTimer = 0;
+let specEma: Float64Array[] = [];
+let noise: NoiseFloor[] = [];
+let ring: { t: number; x: Cross[] }[] = []; // recent onset frames: one cross spectrum per pair
 
 const showError = (m: string) => { out.error.textContent = m; };
 const num = (el: HTMLInputElement, dflt: number) => (Number.isFinite(+el.value) && +el.value > 0 ? +el.value : dflt);
+const css = (v: string) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const colors = () => [css('--acc'), '#f59e0b', '#22c55e'];
+
+/** Mic positions (m). 2 mics: baseline d on the x axis. 3 mics: user "x,y x,y x,y", else equilateral side d. */
+function micPositions(n: number, d: number): Vec2[] {
+  if (n === 2) return [[-d / 2, 0], [d / 2, 0]];
+  const v = posIn.value.trim().split(/[\s;]+/).filter(Boolean).map((s) => s.split(',').map(Number));
+  return v.length === 3 && v.every((p) => p.length === 2 && p.every(Number.isFinite)) ? (v as Vec2[]) : trianglePositions(d);
+}
 const params = () => {
   const d = num(baseline, 0.2);
   const c = speedOfSound(Number.isFinite(+temp.value) ? +temp.value : 20);
-  return { d, c };
+  return { d, c, pos: micPositions(nMics, d) };
 };
+const dist = (p: Vec2, q: Vec2) => Math.hypot(p[0] - q[0], p[1] - q[1]);
 
 for (const [el, o] of [[thresh, 'threshOut'], [alpha, 'alphaOut']] as const)
   el.addEventListener('input', () => { $(o).textContent = (+el.value).toFixed(2); });
 
+let devs: MediaDeviceInfo[] = [];
 async function listDevices() {
-  const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput');
-  for (const [sel, pick] of [[devA, 0], [devB, 1]] as const) {
-    const prev = sel.value;
-    sel.innerHTML = '';
-    devs.forEach((d, i) => sel.add(new Option(d.label || `Microphone ${i + 1}`, d.deviceId)));
-    if (devs.some((d) => d.deviceId === prev)) sel.value = prev;
-    else if (devs[pick]) sel.value = devs[pick].deviceId;
-  }
+  devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput');
+  fillSelects();
   // Before permission, Safari/Firefox hide devices and Chrome hides ids and labels.
   const locked = !devs.length || devs.every((d) => !d.deviceId || !d.label);
   allowBtn.classList.toggle('hidden', !locked);
@@ -49,27 +64,43 @@ async function listDevices() {
   else if (out.error.textContent?.startsWith('Click "Allow')) showError('');
 }
 
-const allowBtn = $('allow') as HTMLButtonElement;
+function fillSelects() {
+  const sets: [HTMLSelectElement, string | undefined, [string, string][]][] = [
+    [devA, devs[0]?.deviceId, []],
+    [devB, devs[1]?.deviceId, probedCh >= 2 ? [['Mic A device, input 2', IN2]] : []],
+    [devC, '', [['None (2 mics)', ''], ...(probedCh >= 3 ? [['Mic A device, input 3', IN3]] as [string, string][] : [])]],
+  ];
+  for (const [sel, dflt, extra] of sets) {
+    const prev = sel.value;
+    sel.innerHTML = '';
+    for (const [label, v] of extra) sel.add(new Option(label, v));
+    devs.forEach((d, i) => sel.add(new Option(d.label || `Microphone ${i + 1}`, d.deviceId)));
+    const ok = (v: string) => Array.from(sel.options).some((o) => o.value === v);
+    sel.value = ok(prev) ? prev : dflt !== undefined && ok(dflt) ? dflt : sel.options[0]?.value ?? '';
+  }
+  if (!ctx) { nMics = devC.value ? 3 : 2; drawEmpty(); }
+}
+
+const allowBtn = $<HTMLButtonElement>('allow');
 async function allowMics() {
   showError('');
   try {
     const s = await navigator.mediaDevices.getUserMedia({ audio: RAW });
     s.getTracks().forEach((t) => t.stop());
     await listDevices();
-    await probeStereo();
+    await probeChannels();
   } catch (e) { showError(describeError(e)); }
 }
 
-/** Opens device A asking for 2 channels; offers L/R mode if it actually delivers 2. */
-async function probeStereo() {
+/** Opens device A asking for 3 channels; offers its inputs 2/3 as Mic B/C if it delivers them. */
+async function probeChannels() {
   if (!devA.value || !navigator.mediaDevices) return;
   try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: devA.value }, channelCount: { ideal: 2 }, ...RAW } });
-    const ch = s.getAudioTracks()[0]?.getSettings().channelCount ?? 1;
+    const s = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: devA.value }, channelCount: { ideal: 3 }, ...RAW } });
+    probedCh = s.getAudioTracks()[0]?.getSettings().channelCount ?? 1;
     s.getTracks().forEach((t) => t.stop());
-    stereoWrap.classList.toggle('hidden', ch < 2);
-    if (ch < 2) stereo.checked = false;
-  } catch { /* probe is best-effort */ }
+  } catch { probedCh = 1; /* probe is best-effort */ }
+  fillSelects();
 }
 
 async function openMic(id: string, channels: number) {
@@ -80,47 +111,78 @@ function describeError(e: unknown): string {
   const n = (e as DOMException)?.name;
   if (n === 'NotAllowedError') return 'Microphone permission denied. Allow mic access and try again.';
   if (n === 'NotFoundError') return 'Selected microphone not found. Re-select devices.';
-  if (n === 'OverconstrainedError') return 'Device rejected the requested settings (channel count). Try mono mode or another device.';
+  if (n === 'OverconstrainedError') return 'Device rejected the requested settings (channel count). Pick separate devices instead.';
   if (n === 'NotReadableError') return 'Microphone is busy or unavailable (in use by another app?).';
   return `Error: ${(e as Error)?.message ?? e}`;
+}
+
+/** Which device and channel feeds each mic. */
+function sources(): { dev: string; ch: number }[] | string {
+  const pick = (v: string) => (v === IN2 ? { dev: devA.value, ch: 1 } : v === IN3 ? { dev: devA.value, ch: 2 } : { dev: v, ch: 0 });
+  const s = [{ dev: devA.value, ch: 0 }, pick(devB.value), ...(devC.value ? [pick(devC.value)] : [])];
+  const keys = s.map((x) => `${x.dev}#${x.ch}`);
+  return new Set(keys).size === keys.length ? s : 'Pick a different device (or input) for each mic.';
 }
 
 async function start() {
   showError('');
   if (!window.isSecureContext || !navigator.mediaDevices) return showError('Needs HTTPS (or localhost) for microphone access.');
   if (typeof AudioWorkletNode === 'undefined') return showError('This browser lacks AudioWorklet support.');
-  const useStereo = stereo.checked && !stereoWrap.classList.contains('hidden');
-  if (!useStereo && devA.value === devB.value) return showError('Pick two different devices, or use L/R of a stereo device.');
+  const srcs = sources();
+  if (typeof srcs === 'string') return showError(srcs);
+  nMics = srcs.length;
+  pairs = nMics === 3 ? [[0, 1], [0, 2], [1, 2]] : [[0, 1]];
+  ema = pairs.map(() => null);
+  noise = Array.from({ length: nMics }, () => new NoiseFloor());
+  ring = [];
+  if (cal && cal.length !== nMics - 1) cal = null;
   btn.start.disabled = true;
   try {
     ctx = new AudioContext({ latencyHint: 'interactive' });
     await ctx.audioWorklet.addModule(`${import.meta.env.BASE_URL}capture-worklet.js`);
-    const size = ctx.sampleRate > 60000 ? 8192 : 4096;
+    const size = ctx.sampleRate > 60000 ? 8192 : 4096, hop = size / 2;
     const node = new AudioWorkletNode(ctx, 'capture', {
-      numberOfInputs: 1, numberOfOutputs: 1, channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'discrete',
-      processorOptions: { size, hop: size / 2 },
+      numberOfInputs: 1, numberOfOutputs: 1, channelCount: nMics, channelCountMode: 'explicit', channelInterpretation: 'discrete',
+      processorOptions: { channels: nMics, hop },
     });
-    if (useStereo) {
-      streams = [await openMic(devA.value, 2)];
-      ctx.createMediaStreamSource(streams[0]).connect(node);
-    } else {
-      streams = [await openMic(devA.value, 1), await openMic(devB.value, 1)];
-      const merger = ctx.createChannelMerger(2);
-      ctx.createMediaStreamSource(streams[0]).connect(merger, 0, 0);
-      ctx.createMediaStreamSource(streams[1]).connect(merger, 0, 1);
-      merger.connect(node);
+    const merger = ctx.createChannelMerger(nMics);
+    const ids = [...new Set(srcs.map((s) => s.dev))];
+    streams = [];
+    for (const id of ids) {
+      const mine = srcs.map((s, k) => [s, k] as const).filter(([s]) => s.dev === id);
+      const chans = Math.max(...mine.map(([s]) => s.ch)) + 1;
+      const stream = await openMic(id, chans);
+      streams.push(stream);
+      const src = ctx.createMediaStreamSource(stream);
+      if (chans === 1) src.connect(merger, 0, mine[0][1]);
+      else {
+        const split = ctx.createChannelSplitter(chans);
+        src.connect(split);
+        for (const [s, k] of mine) split.connect(merger, s.ch, k);
+      }
     }
+    merger.connect(node);
     for (const s of streams) for (const t of s.getTracks()) t.onended = () => { showError('A microphone disconnected.'); stop(); };
     const mute = ctx.createGain(); mute.gain.value = 0; // keep the node pulled without monitoring
     node.connect(mute).connect(ctx.destination);
-    node.port.onmessage = (ev) => onWindow(ev.data.a, ev.data.b, ev.data.t, size);
+    // High-pass each channel as a continuous stream, then slide it into a size-sample window.
+    const fs = ctx.sampleRate;
+    const hp = srcs.map(() => new HighPass(HP_HZ, fs));
+    const win = srcs.map(() => new Float32Array(size));
+    let filled = 0;
+    specEma = [];
+    node.port.onmessage = (ev) => {
+      const { ch, t } = ev.data as { ch: Float32Array[]; t: number };
+      ch.forEach((x, k) => { win[k].copyWithin(0, x.length); hp[k].process(x, win[k].subarray(size - x.length)); });
+      filled = Math.min(size, filled + hop);
+      if (filled === size) onWindow(win, t, size);
+    };
     await ctx.resume();
-    out.fs.textContent = `${ctx.sampleRate} Hz`;
-    ema = null;
+    out.fs.textContent = `${fs} Hz`;
     await listDevices(); // labels become available after permission
     btn.stop.disabled = btn.cal.disabled = btn.click.disabled = false;
     btn.resetCal.disabled = !cal;
-    if (!useStereo && !cal) out.cal.textContent = 'Two separate devices: calibrate now (clap at broadside) to remove the clock offset.';
+    if (ids.length > 1 && !cal) out.cal.textContent = 'Separate devices: calibrate now (clap at the calibration azimuth) to remove the clock offsets.';
   } catch (e) {
     showError(describeError(e));
     stop();
@@ -140,64 +202,93 @@ function stop() {
 
 function rms(x: Float32Array) { let s = 0; for (const v of x) s += v * v; return Math.sqrt(s / x.length); }
 function peakAbs(x: Float32Array) { let m = 0; for (const v of x) m = Math.max(m, Math.abs(v)); return m; }
+const calCenter = (k: number, t: number) => (k === 0 || !cal ? 0 : cal[k - 1].a + cal[k - 1].b * t);
 
-function onWindow(a: Float32Array, b: Float32Array, t: number, size: number) {
+function onWindow(chs: Float32Array[], t: number, size: number) {
   if (!ctx) return;
-  drawWave(a, b);
-  const fs = ctx.sampleRate;
-  const { d, c } = params();
-  const phys = maxLagSamples(d, c, fs);
-  const level = Math.min(rms(a), rms(b));
-  const transient = Math.min(peakAbs(a), peakAbs(b)) > 6 * floor;
+  const fs = ctx.sampleRate, lo = HP_HZ / fs;
+  const frames = chs.map(analyze);
+  drawWave(chs);
+  drawSpectra(frames);
+  const { d, c, pos } = params();
+  const level = Math.min(...chs.map(rms));
+  const onset = Math.min(...chs.map(peakAbs)) > 6 * floor;
   floor = level < floor ? 0.9 * floor + 0.1 * level : floor * 1.002 + 1e-7; // tracks quiet level
+  if (!onset) { // quiet frame: learn the noise floor, keep the last estimate
+    frames.forEach((f, k) => noise[k].update(f.pow));
+    lastConf = 0; out.conf.textContent = '0.00';
+    return;
+  }
+  const masks = frames.map((f, k) => snrMask(f.pow, noise[k].psd));
+  const xc = (i: number, j: number) => cross(frames[i], frames[j], masks[i], masks[j], lo);
 
   if (calRun) {
-    // Wide search: unknown device offset can be many ms.
-    const r = gccPhat(a, b, size / 4, 0);
-    drawCorr(r.corr);
-    if (transient && r.peak >= Math.max(+thresh.value, 0.2)) { calRun.t.push(t); calRun.lag.push(r.lag); }
-    out.cal.textContent = `Calibrating… clap or click at broadside (90°). ${calRun.t.length} hits, ${Math.max(0, calRun.until - t).toFixed(1)} s left`;
+    // Wide search against A, one frame per hit: unknown device offsets can be many ms. Subtract the cal direction's geometry.
+    const u = azVec(Number.isFinite(+calAz.value) ? +calAz.value : 90);
+    const rs = chs.slice(1).map((_, k) => gccFromCross(xc(0, k + 1), size / 4, 0));
+    drawCorr(rs[0].corr);
+    if (rs.every((r) => !r.edge && r.peak >= Math.max(+thresh.value, 0.2))) {
+      calRun.t.push(t);
+      rs.forEach((r, k) => calRun!.lag[k].push(r.lag - tdoa(pos[0], pos[k + 1], u, c) * fs));
+    }
+    out.cal.textContent = `Calibrating… clap or click at ${calAz.value || 90}°. ${calRun.t.length} hits, ${Math.max(0, calRun.until - t).toFixed(1)} s left`;
     if (t >= calRun.until) finishCalibration();
     return;
   }
 
-  const center = cal ? cal.a + cal.b * t : 0;
-  const r = gccPhat(a, b, phys + 2, center);
-  drawCorr(r.corr);
-  lastConf = level > 1e-5 ? r.peak : 0;
-  out.conf.textContent = lastConf.toFixed(2);
+  ring = [...ring.filter((r) => t - r.t < AVG_SECONDS), { t, x: pairs.map(([i, j]) => xc(i, j)) }].slice(-AVG_FRAMES);
+  const rs = pairs.map(([i, j], p) => {
+    const center = calCenter(j, t) - calCenter(i, t), phys = maxLagSamples(dist(pos[i], pos[j]), c, fs);
+    const r = gccFromCross(sumCross(ring.map((f) => f.x[p])), phys + 2, center);
+    return { ...r, rel: Math.max(-phys, Math.min(phys, r.lag - center)) };
+  });
+  drawCorr(rs[0].corr);
+  lastConf = level > 1e-5 && !rs.some((r) => r.edge) ? Math.min(...rs.map((r) => r.peak)) : 0;
+  out.conf.textContent = rs.some((r) => r.edge) ? 'edge' : lastConf.toFixed(2);
   if (lastConf >= +thresh.value) {
-    const rel = Math.max(-phys, Math.min(phys, r.lag - center));
     const k = +alpha.value;
-    ema = ema === null ? rel : k * rel + (1 - k) * ema;
+    ema = rs.map((r, p) => (ema[p] === null ? r.rel : k * r.rel + (1 - k) * ema[p]!));
   }
-  if (ema !== null) {
-    const ang = angleDeg(ema / fs, d, c);
+  if (ema[0] === null) return drawEmpty();
+  const lags = ema as number[];
+  out.delayMs.textContent = lags.map((l) => ((l / fs) * 1000).toFixed(3)).join(' / ') + ' ms';
+  out.delaySmp.textContent = lags.map((l) => l.toFixed(2)).join(' / ');
+  if (nMics === 2) {
+    const ang = angleDeg(lags[0] / fs, d, c);
     out.angle.textContent = `${ang.toFixed(1)}°`;
-    out.delayMs.textContent = `${((ema / fs) * 1000).toFixed(3)} ms`;
-    out.delaySmp.textContent = ema.toFixed(2);
     drawView(ang);
-  } else drawView(null);
+  } else {
+    const sol = solveDoa(pos, pairs.map(([i, j], p) => ({ i, j, tau: lags[p] / fs })), c);
+    if (Number.isNaN(sol.az)) { showError('Mic positions are collinear; 3 mics need a triangle.'); return drawPolar(null, pos); }
+    out.angle.textContent = `${sol.az.toFixed(1)}°`;
+    drawPolar(sol.az, pos);
+  }
 }
 
 function startCalibration() {
   if (!ctx) return;
-  calRun = { until: ctx.currentTime + CAL_SECONDS, t: [], lag: [] };
-  ema = null;
+  calRun = { until: ctx.currentTime + CAL_SECONDS, t: [], lag: pairs.slice(0, nMics - 1).map(() => []) };
+  ema = pairs.map(() => null);
+  ring = [];
 }
 
 function finishCalibration() {
   const run = calRun!;
   calRun = null;
   if (!ctx) return;
-  if (run.t.length < 2) { out.cal.textContent = 'Calibration failed: no clear clap/click detected. Try louder, closer, at broadside.'; return; }
-  // Reject outliers (echoes, tonal ambiguity), then fit offset + drift on the inliers.
-  const med = median(run.lag);
-  const keep = run.lag.map((l, i) => [run.t[i], l] as const).filter(([, l]) => Math.abs(l - med) <= 2);
-  if (keep.length < 2 || keep.length < run.lag.length / 2) { out.cal.textContent = 'Calibration failed: hits disagree (echoes or tonal sound?). Use sharp claps/clicks.'; return; }
-  const fit = fitLine(keep.map((k) => k[0]), keep.map((k) => k[1]));
-  if (Math.abs(fit.b) > 2e-4 * ctx!.sampleRate) fit.b = 0; // >200 ppm isn't clock drift
-  cal = fit;
+  if (run.t.length < 2) { out.cal.textContent = 'Calibration failed: no clear clap/click on every mic. Try louder or closer.'; return; }
+  // Per mic: reject outliers (echoes, tonal ambiguity), then fit offset + drift on the inliers.
+  const fits: { a: number; b: number }[] = [];
+  for (const lags of run.lag) {
+    const med = median(lags);
+    const keep = lags.map((l, i) => [run.t[i], l] as const).filter(([, l]) => Math.abs(l - med) <= 2);
+    if (keep.length < 2 || keep.length < lags.length / 2) { out.cal.textContent = 'Calibration failed: hits disagree (echoes or tonal sound?). Use sharp claps/clicks.'; return; }
+    const fit = fitLine(keep.map((k) => k[0]), keep.map((k) => k[1]));
+    if (Math.abs(fit.b) > 2e-4 * ctx.sampleRate) fit.b = 0; // >200 ppm isn't clock drift
+    fits.push(fit);
+  }
+  cal = fits;
+  ring = [];
   btn.resetCal.disabled = false;
   updateOffset();
   out.cal.textContent = `Calibrated from ${run.t.length} hits.`;
@@ -205,12 +296,12 @@ function finishCalibration() {
 
 function updateOffset() {
   if (!cal || !ctx) { out.offset.textContent = 'none'; return; }
-  const o = cal.a + cal.b * ctx.currentTime;
-  out.offset.textContent = `${o.toFixed(1)} smp, ${(cal.b * 60).toFixed(2)} smp/min`;
+  const now = ctx.currentTime;
+  out.offset.textContent = cal.map((f, k) => `${NAMES[k + 1]} ${(f.a + f.b * now).toFixed(1)} smp, ${(f.b * 60).toFixed(2)}/min`).join('; ');
 }
 setInterval(updateOffset, 1000);
 
-/** Short noise-burst click train through the default output; put the speaker at broadside. */
+/** Short noise-burst click train through the default output; put the speaker at the calibration azimuth. */
 function toggleClicks() {
   if (!ctx) return;
   if (clickTimer) { clearInterval(clickTimer); clickTimer = 0; btn.click.textContent = 'Play clicks'; return; }
@@ -224,8 +315,12 @@ function toggleClicks() {
   btn.click.textContent = 'Stop clicks';
 }
 
-const css = (v: string) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function drawEmpty() {
+  if (nMics === 2) drawView(null);
+  else drawPolar(null, params().pos);
+}
 
+/** 2 mics: front half-plane, 0° = toward A (left). */
 function drawView(ang: number | null) {
   const g = view.getContext('2d')!, W = view.width, H = view.height;
   const cx = W / 2, cy = H - 40, R = Math.min(W / 2, H) - 60;
@@ -237,8 +332,8 @@ function drawView(ang: number | null) {
     g.fillText(`${deg}°`, cx - Math.cos(th) * (R + 14) - 10, cy - Math.sin(th) * (R + 14));
   }
   const mx = R * 0.35;
-  g.fillStyle = css('--acc');
-  for (const [x, l] of [[cx - mx, 'A'], [cx + mx, 'B']] as const) {
+  for (const [x, l, col] of [[cx - mx, 'A', colors()[0]], [cx + mx, 'B', colors()[1]]] as const) {
+    g.fillStyle = col;
     g.beginPath(); g.arc(x, cy, 9, 0, 2 * Math.PI); g.fill();
     g.fillText(`Mic ${l}`, x - 16, cy + 26);
   }
@@ -250,14 +345,43 @@ function drawView(ang: number | null) {
   g.globalAlpha = 1;
 }
 
-const waveCv = $('wave') as HTMLCanvasElement;
-/** Mic A on top, Mic B below, shared scale so level differences show. Min/max per pixel column. */
-function drawWave(a: Float32Array, b: Float32Array) {
-  const g = waveCv.getContext('2d')!, W = waveCv.width, H = waveCv.height, lane = H / 2;
+/** 3 mics: full circle, mics drawn at their positions around the centroid. */
+function drawPolar(az: number | null, pos: Vec2[]) {
+  const g = view.getContext('2d')!, W = view.width, H = view.height;
+  const cx = W / 2, cy = H / 2, R = H / 2 - 30;
   g.clearRect(0, 0, W, H);
-  const max = Math.max(peakAbs(a), peakAbs(b), 1e-4);
-  const lanes: [Float32Array, string, string][] = [[a, css('--acc'), 'Mic A'], [b, '#f59e0b', 'Mic B']];
-  lanes.forEach(([x, color, name], k) => {
+  g.strokeStyle = css('--muted'); g.fillStyle = css('--muted'); g.lineWidth = 1; g.font = '12px system-ui';
+  g.beginPath(); g.arc(cx, cy, R, 0, 2 * Math.PI); g.stroke();
+  for (let deg = 0; deg < 360; deg += 45) {
+    const [ux, uy] = azVec(deg);
+    g.fillText(`${deg}°`, cx + ux * (R + 16) - 10, cy - uy * (R + 16) + 4);
+  }
+  const mx = pos.reduce((s, p) => s + p[0], 0) / pos.length, my = pos.reduce((s, p) => s + p[1], 0) / pos.length;
+  const span = Math.max(1e-6, ...pos.map((p) => Math.hypot(p[0] - mx, p[1] - my)));
+  pos.forEach((p, k) => {
+    const x = cx + ((p[0] - mx) / span) * R * 0.35, y = cy - ((p[1] - my) / span) * R * 0.35;
+    g.fillStyle = colors()[k];
+    g.beginPath(); g.arc(x, y, 9, 0, 2 * Math.PI); g.fill();
+    g.fillText(`Mic ${NAMES[k]}`, x - 16, y + 24);
+  });
+  if (az === null) return;
+  const [ux, uy] = azVec(az);
+  g.globalAlpha = lastConf >= +thresh.value ? 1 : 0.35;
+  g.strokeStyle = css('--ray'); g.lineWidth = 4;
+  g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + ux * R, cy - uy * R); g.stroke();
+  g.globalAlpha = 1;
+}
+
+const LANE = 100; // px per channel lane in the wave and spectrum canvases
+const fitLanes = (cv: HTMLCanvasElement, n: number) => { if (cv.height !== LANE * n) cv.height = LANE * n; };
+
+/** One lane per mic, each scaled to its own peak (floor -60 dBFS) so a quiet mic stays visible. */
+function drawWave(chs: Float32Array[]) {
+  fitLanes(waveCv, chs.length);
+  const g = waveCv.getContext('2d')!, W = waveCv.width, H = waveCv.height, lane = H / chs.length;
+  g.clearRect(0, 0, W, H);
+  chs.forEach((x, k) => {
+    const pk = peakAbs(x), max = Math.max(pk, 1e-3), color = colors()[k];
     const mid = lane * k + lane / 2, amp = lane / 2 - 4, per = x.length / W;
     g.strokeStyle = css('--muted'); g.lineWidth = 1; g.beginPath(); g.moveTo(0, mid); g.lineTo(W, mid); g.stroke();
     g.strokeStyle = color; g.beginPath();
@@ -267,7 +391,45 @@ function drawWave(a: Float32Array, b: Float32Array) {
       g.moveTo(px + 0.5, mid - (hi / max) * amp); g.lineTo(px + 0.5, mid - (lo / max) * amp + 0.5);
     }
     g.stroke();
-    g.fillStyle = color; g.font = '20px system-ui'; g.fillText(name, 8, lane * k + 22);
+    const db = pk > 0 ? 20 * Math.log10(pk) : -Infinity;
+    g.fillStyle = color; g.font = '15px system-ui';
+    g.fillText(`Mic ${NAMES[k]}  ${Number.isFinite(db) ? db.toFixed(1) : '-∞'} dBFS`, 8, lane * k + 20);
+  });
+}
+
+/** Log-frequency magnitude spectrum per mic (dBFS, EMA-smoothed), high-pass region shaded. */
+function drawSpectra(chs: Frame[]) {
+  if (!ctx) return;
+  fitLanes(specCv, chs.length);
+  const fs = ctx.sampleRate, ny = fs / 2, f0 = 20, DB_LO = -120, DB_HI = 0;
+  const g = specCv.getContext('2d')!, W = specCv.width, H = specCv.height, lane = H / chs.length;
+  const fx = (f: number) => (Math.log(f / f0) / Math.log(ny / f0)) * W;
+  g.clearRect(0, 0, W, H);
+  chs.forEach((x, k) => {
+    const s = spectrumDb(x);
+    const prev = specEma[k];
+    specEma[k] = prev && prev.length === s.length ? prev.map((v, i) => 0.7 * v + 0.3 * s[i]) : s;
+    const sm = specEma[k], top = lane * k, binHz = fs / x.pow.length, color = colors()[k];
+    g.fillStyle = 'rgba(127,127,127,0.15)'; g.fillRect(0, top, fx(HP_HZ), lane);
+    g.strokeStyle = 'rgba(127,127,127,0.35)'; g.lineWidth = 1; g.fillStyle = css('--muted'); g.font = '11px system-ui';
+    for (const [f, l] of [[100, '100'], [1000, '1k'], [10000, '10k']] as const) {
+      if (f >= ny) continue;
+      g.beginPath(); g.moveTo(fx(f) + 0.5, top); g.lineTo(fx(f) + 0.5, top + lane); g.stroke();
+      if (k === chs.length - 1) g.fillText(l, fx(f) + 3, top + lane - 3);
+    }
+    g.strokeStyle = css('--muted'); g.beginPath(); g.moveTo(0, top + lane - 0.5); g.lineTo(W, top + lane - 0.5); g.stroke();
+    g.strokeStyle = color; g.lineWidth = 1.5; g.beginPath();
+    let started = false;
+    for (let px = 0; px < W; px++) {
+      // max over the bins this pixel spans (low end: nearest bin)
+      const fa = f0 * (ny / f0) ** (px / W), fb = f0 * (ny / f0) ** ((px + 1) / W);
+      let v = -Infinity;
+      for (let b = Math.round(fa / binHz), e = Math.max(b, Math.round(fb / binHz) - 1); b <= e && b < sm.length; b++) v = Math.max(v, sm[b]);
+      const y = top + 2 + ((DB_HI - Math.max(DB_LO, Math.min(DB_HI, v))) / (DB_HI - DB_LO)) * (lane - 4);
+      started ? g.lineTo(px, y) : g.moveTo(px, y); started = true;
+    }
+    g.stroke();
+    g.fillStyle = color; g.font = '12px system-ui'; g.fillText(`Mic ${NAMES[k]}`, W - 44, top + 14);
   });
 }
 
@@ -286,10 +448,10 @@ btn.start.onclick = start;
 btn.stop.onclick = stop;
 btn.cal.onclick = startCalibration;
 btn.click.onclick = toggleClicks;
-btn.resetCal.onclick = () => { cal = null; ema = null; btn.resetCal.disabled = true; updateOffset(); out.cal.textContent = ''; };
-devA.onchange = probeStereo;
-stereo.onchange = () => { devB.disabled = stereo.checked; };
-navigator.mediaDevices?.addEventListener('devicechange', () => listDevices().then(probeStereo));
-drawView(null);
-if (navigator.mediaDevices) listDevices().then(probeStereo).catch((e) => showError(describeError(e)));
+btn.resetCal.onclick = () => { cal = null; ema = pairs.map(() => null); ring = []; btn.resetCal.disabled = true; updateOffset(); out.cal.textContent = ''; };
+devA.onchange = probeChannels;
+devC.onchange = posIn.oninput = baseline.oninput = () => { if (!ctx) { nMics = devC.value ? 3 : 2; drawEmpty(); } };
+navigator.mediaDevices?.addEventListener('devicechange', () => listDevices().then(probeChannels));
+drawEmpty();
+if (navigator.mediaDevices) listDevices().then(probeChannels).catch((e) => showError(describeError(e)));
 else showError('Needs HTTPS (or localhost) for microphone access.');

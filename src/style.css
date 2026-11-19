@@ -23,4 +23,5 @@ button:disabled { opacity:.4; cursor:default; }
 #angle { font-size:1.6rem; }
 #corr { background:var(--card); border-radius:6px; width:100%; }
 
+.wave { display:grid; grid-template-columns:2fr 1fr; gap:12px; }
 .wave canvas { width:100%; height:auto; display:block; margin-top:12px; border-radius:8px; background:var(--panel, transparent); }

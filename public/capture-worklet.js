@@ -1,26 +1,26 @@
-// Buffers sample-aligned windows from a 2-channel input (ch0 = mic A, ch1 = mic B)
-// and posts them to the main thread every `hop` samples.
+// Posts each `hop` samples of N channels (ch0 = mic A, ch1 = B, ch2 = C), sample-aligned.
+// The main thread high-passes and assembles overlapping analysis windows.
 class Capture extends AudioWorkletProcessor {
   constructor(opts) {
     super();
-    const { size = 4096, hop = 2048 } = opts.processorOptions || {};
-    this.size = size; this.hop = hop;
-    this.a = new Float32Array(size); this.b = new Float32Array(size);
-    this.fill = 0; this.sinceHop = 0;
+    const { channels = 2, hop = 2048 } = opts.processorOptions || {};
+    this.n = channels; this.hop = hop; this.fill = 0;
+    this.buf = Array.from({ length: channels }, () => new Float32Array(hop));
   }
   process(inputs) {
     const ch = inputs[0];
-    if (!ch || ch.length < 2) return true; // wait until both channels are connected
-    const x = ch[0], y = ch[1], n = x.length;
-    // shift-in: keep the newest `size` samples
-    this.a.copyWithin(0, n); this.b.copyWithin(0, n);
-    this.a.set(x, this.size - n); this.b.set(y, this.size - n);
-    this.fill = Math.min(this.size, this.fill + n);
-    this.sinceHop += n;
-    if (this.fill === this.size && this.sinceHop >= this.hop) {
-      this.sinceHop = 0;
-      const a = this.a.slice(), b = this.b.slice();
-      this.port.postMessage({ a, b, t: currentTime }, [a.buffer, b.buffer]);
+    if (!ch || ch.length < this.n) return true; // wait until every channel is connected
+    const len = ch[0].length;
+    for (let off = 0; off < len; ) {
+      const k = Math.min(len - off, this.hop - this.fill);
+      for (let c = 0; c < this.n; c++) this.buf[c].set(ch[c].subarray(off, off + k), this.fill);
+      this.fill += k; off += k;
+      if (this.fill === this.hop) {
+        const out = this.buf;
+        this.buf = out.map(() => new Float32Array(this.hop));
+        this.fill = 0;
+        this.port.postMessage({ ch: out, t: currentTime + off / sampleRate }, out.map((b) => b.buffer));
+      }
     }
     return true;
   }
