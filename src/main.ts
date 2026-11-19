@@ -143,6 +143,7 @@ function peakAbs(x: Float32Array) { let m = 0; for (const v of x) m = Math.max(m
 
 function onWindow(a: Float32Array, b: Float32Array, t: number, size: number) {
   if (!ctx) return;
+  drawWave(a, b);
   const fs = ctx.sampleRate;
   const { d, c } = params();
   const phys = maxLagSamples(d, c, fs);
@@ -247,6 +248,27 @@ function drawView(ang: number | null) {
   g.strokeStyle = css('--ray'); g.lineWidth = 4;
   g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx - Math.cos(th) * R, cy - Math.sin(th) * R); g.stroke();
   g.globalAlpha = 1;
+}
+
+const waveCv = $('wave') as HTMLCanvasElement;
+/** Mic A on top, Mic B below, shared scale so level differences show. Min/max per pixel column. */
+function drawWave(a: Float32Array, b: Float32Array) {
+  const g = waveCv.getContext('2d')!, W = waveCv.width, H = waveCv.height, lane = H / 2;
+  g.clearRect(0, 0, W, H);
+  const max = Math.max(peakAbs(a), peakAbs(b), 1e-4);
+  const lanes: [Float32Array, string, string][] = [[a, css('--acc'), 'Mic A'], [b, '#f59e0b', 'Mic B']];
+  lanes.forEach(([x, color, name], k) => {
+    const mid = lane * k + lane / 2, amp = lane / 2 - 4, per = x.length / W;
+    g.strokeStyle = css('--muted'); g.lineWidth = 1; g.beginPath(); g.moveTo(0, mid); g.lineTo(W, mid); g.stroke();
+    g.strokeStyle = color; g.beginPath();
+    for (let px = 0; px < W; px++) {
+      let lo = Infinity, hi = -Infinity;
+      for (let i = Math.floor(px * per), e = Math.min(x.length, Math.floor((px + 1) * per) + 1); i < e; i++) { const v = x[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+      g.moveTo(px + 0.5, mid - (hi / max) * amp); g.lineTo(px + 0.5, mid - (lo / max) * amp + 0.5);
+    }
+    g.stroke();
+    g.fillStyle = color; g.font = '20px system-ui'; g.fillText(name, 8, lane * k + 22);
+  });
 }
 
 function drawCorr(r: Float64Array) {
